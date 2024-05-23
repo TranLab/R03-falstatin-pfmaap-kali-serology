@@ -1,0 +1,278 @@
+---
+title: "R03 IgG Subclass Reactivity Analysis"
+author: "Tuan M. Tran"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document :
+    theme: cerulean
+    toc: TRUE
+    number_sections: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Objective
+
+1. Read in and arrange data from IgG subclass ELISA data for R03 antigens:
+  falstatin_110_125
+  falstatin_289_335
+  falstatin_FL
+  MAAP_22_143
+  MAAP_34_57
+
+2. Analyze above data for assess subclass reactivity and subclass seroprevalence.
+
+# Setup
+
+## Load libraries
+
+```{r load libraries, message=FALSE, warning=FALSE}
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(ggbeeswarm)
+```
+
+## Read-in and clean data
+
+```{r read in data}
+datadir <- "/Users/tuantran/Library/CloudStorage/GoogleDrive-tuantran@iu.edu/Shared drives/[Sec] IN-MED-INF-TRANLAB/Tran Lab Shared/Projects/R03 PfMAAP and falstatin/Subclass Runs/"
+data_list <- list.files(datadir)
+col_types <- c("text","text","numeric", "numeric", "text", "numeric", "numeric")
+plate1_list <- lapply(paste0(datadir, data_list), read_xlsx, sheet = "Sum.Analysis", range = "A3:G99", col_types = col_types)
+names(plate1_list) <- data_list
+plate1_df <- bind_rows(plate1_list, .id = "run")
+plate1_df$plate <- "plate_1"
+
+plate2_list <- lapply(paste0(datadir, data_list), read_xlsx, sheet = "Sum.Analysis", range = "I3:O99", col_types = col_types)
+names(plate2_list) <- data_list
+plate2_df <- bind_rows(plate2_list, .id = "run")
+plate2_df$plate <- "plate_2"
+
+plate3_list <- lapply(paste0(datadir, data_list), read_xlsx, sheet = "Sum.Analysis", range = "Q3:W99", col_types = col_types)
+names(plate3_list) <- data_list
+plate3_df <- bind_rows(plate3_list, .id = "run")
+plate3_df$plate <- "plate_3"
+
+plate4_list <- lapply(paste0(datadir, data_list), read_xlsx, sheet = "Sum.Analysis", range = "Y3:AE99", col_types = col_types)
+names(plate4_list) <- data_list
+plate4_df <- bind_rows(plate4_list, .id = "run")
+plate4_df$plate <- "plate_4"
+
+plate5_list <- lapply(paste0(datadir, data_list), read_xlsx, sheet = "Sum.Analysis", range = "AG3:AM99", col_types = col_types)
+names(plate5_list) <- data_list
+plate5_df <- bind_rows(plate5_list, .id = "run")
+plate5_df$plate <- "plate_5"
+
+all_runs <- bind_rows(plate1_df, plate2_df, plate3_df, plate4_df, plate5_df) %>%
+  mutate(assay_date = as.Date(gsub("\\ Run.*", "", run), format = "%y%m%d")) %>%
+  mutate(run = gsub("^([^ ]* [^ ]* [^ ]*).*", "\\1", run)) %>%
+  mutate(run = as.integer(gsub(".*Run", "", run, run))) %>%
+  dplyr::select(run, assay_date, plate, everything())
+```
+
+## Construct IgG subclass map positions and merge
+
+```{r construct map positions}
+subclass_df <- data.frame(subclass = c(rep("IgG1", 16), rep("IgG2", 16), rep("IgG3", 16), rep("IgG4", 16),
+                                       rep("total IgG", 16), rep("AMA total IgG", 16)),
+                          row_position = rep(LETTERS[1:8], 12),
+                          col_position = rep(1:12, each=8)) %>%
+  mutate(Position = paste0(row_position, col_position))
+
+all_runs <- all_runs %>%
+  left_join(., subclass_df,
+            by = "Position")  %>%
+  dplyr::select(-c(row_position, col_position))
+```
+
+## Determine average and coefficient of variation for technical duplicates
+
+```{r determine average}
+all_runs_average <- all_runs %>%
+  group_by(run, assay_date, plate, Subject, subclass, Antigen, `Plasma Dilution`, `Antigen Dilution`) %>%
+  dplyr::summarise(mean_OD = mean(OD), cv_OD = sd(OD)/mean(OD))
+```
+
+```{r determine average write to file, eval=FALSE}
+all_runs_average %>%
+  filter(cv_OD > 0.20) %>%
+  arrange(run, plate, desc(cv_OD)) %>%
+  writexl::write_xlsx("/Users/tuantran/Library/CloudStorage/GoogleDrive-tuantran@iu.edu/Shared drives/[Sec] IN-MED-INF-TRANLAB/Tran Lab Shared/Projects/R03 PfMAAP and falstatin/Subclass QC Analytics/R03 Subclass Mean and CV by Sample.xlsx")
+```
+
+# Assess variation in AMA1 controls over all plates
+
+```{r AMA1 over all plates, fig.align='center', fig.width=12, fig.height=8}
+ama1_controls <- all_runs %>%
+  filter(subclass == "AMA total IgG") %>%
+  filter(Position == "H11" | Position == "H12") %>%
+  dplyr::select(subclass, run, assay_date, plate, Position, OD)
+
+ama1_conrols_cv <- ama1_controls %>%
+  group_by(run, subclass , assay_date, plate) %>%
+  dplyr::summarise(mean_OD = mean(OD), cv_OD = sd(OD)/mean(OD))
+```
+
+## Write AMA1 ODs to file
+
+```{r write AMA1 controls, eval=FALSE}
+ama1_controls %>%
+  left_join(., ama1_conrols_cv,
+            by = c("subclass", "run", "assay_date", "plate")) %>%
+  arrange(run, plate, Position) %>%
+  writexl::write_xlsx("/Users/tuantran/Library/CloudStorage/GoogleDrive-tuantran@iu.edu/Shared drives/[Sec] IN-MED-INF-TRANLAB/Tran Lab Shared/Projects/R03 PfMAAP and falstatin/Subclass QC Analytics/R03 Total AMA1 controls.xlsx")
+```
+
+## Plot AMA1 normalization controls across all plates
+
+```{r plot ama1 over all plates, fig.align='center', fig.width=14, fig.height=8}
+#plot
+ama1_plot_dat <- ama1_controls %>%
+  left_join(., ama1_conrols_cv,
+            by = c("subclass", "run", "assay_date", "plate")) %>%
+  arrange(run, plate, Position) %>%
+  mutate(run = str_pad(run, 2, pad = "0")) %>%
+  mutate(run_plate = paste("run", run, plate, sep = "_")) %>%
+  mutate(cv_out_of_range = ifelse(cv_OD < 0.2, "CV ≤ 0.20", "CV > 0.20")) %>%
+  mutate(cv_out_of_range = ifelse(is.na(cv_out_of_range), "NA", cv_out_of_range)) %>%
+  mutate(cv_out_of_range = factor(cv_out_of_range, levels = c("CV ≤ 0.20", "CV > 0.20", "NA")))
+
+summary_stats <- ama1_plot_dat %>%
+  filter(OD<1.25 & OD>0.5) %>%
+  summarize(median_OD = median(OD), mean_OD = mean(OD), sd_OD = sd(OD))
+
+OD_range <- 0.1*summary_stats$median_OD
+
+ama1_plot <- ama1_plot_dat %>%
+  ggplot(., aes(x = run_plate, y = OD )) +
+  geom_point(aes(col = cv_out_of_range)) +
+  ggsci::scale_color_aaas() +
+  theme_bw() +
+  scale_y_continuous(breaks = seq(0,3, by =0.25)) +
+  geom_hline(yintercept = summary_stats$median_OD, linetype = "solid", color = "darkgray") +
+  geom_hline(yintercept = summary_stats$median_OD + OD_range, linetype = "dotted", color = "red") +
+  geom_hline(yintercept = summary_stats$median_OD - OD_range, linetype = "dotted", color = "red") +
+  geom_hline(yintercept = summary_stats$median_OD + 2*OD_range, linetype = "dashed", color = "orange") +
+  geom_hline(yintercept = summary_stats$median_OD - 2*OD_range, linetype = "dashed", color = "orange") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        legend.position = "top")
+
+ama1_plot
+```
+
+## Notes on AMA1 normalization control plot
+
+* Gray horizontal line = median of all AMA1 (H11, H12) samples across all plates in runs 4 through 14.
+* Red dotted horizontal lines = median +/- 10% of median (optimal boundaries for AMA1 ODs---if values are within these boundaries, plates are consistent)
+* Orange dashed horizontal lines = median +/- 20% of median (generous boundaries for AMA1 ODs---if values are within these boundaries, plates are acceptable)
+
+* Samples in runs 01 through 03 have high ODs generally above 2.0 given a dilution of 1:100 P17 plasma was used, so should be repeated. At higher OD's, any small change in concentration results in a large change in OD, resulting in higher variance not only between plates but across technical replicates. In addition, with AMA1, a concentration of 1:100 may result in a hook effect (spuriously lower OD when IgG is actually much higher).
+
+    Generally would try to target normalization standard to OD = 1.0 given that 1.0 is reliably in the linear portion of the dilution curve for most ELISA detection assays.
+* Samples in run_01_plate_4 have very large CV, so should be repeated (already being repeated given they are in run_01).
+
+
+
+```{r save ama1 over plates plot, eval=FALSE, echo=FALSE}
+png(filename = "/Users/tuantran/Library/CloudStorage/GoogleDrive-tuantran@iu.edu/Shared drives/[Sec] IN-MED-INF-TRANLAB/Tran Lab Shared/Projects/R03 PfMAAP and falstatin/Subclass QC Analytics/AMA1 Normalization Sample Across Plates.png", res = 300, height = 8, width = 14, units = "in")
+ama1_plot
+dev.off()
+```
+
+## Calculate normalization factor and normalize ODs
+
+```{r set normazliation control}
+all_plate_median <- ama1_plot_dat %>%
+  filter(!run %in% c("01","02","03")) %>%
+  summarize(median = median(mean_OD))
+  
+per_plate_medians <- ama1_plot_dat %>%
+  filter(!run %in% c("01","02","03")) %>%
+  group_by(run_plate) %>%
+  summarize(per_plate_median = median(mean_OD))
+
+all_runs_norm_factor <- all_runs %>%
+  mutate(run = str_pad(run, 2, pad = "0")) %>%
+  mutate(run_plate = paste("run", run, plate, sep = "_")) %>%
+  left_join(., per_plate_medians,
+            by = "run_plate") %>%
+  mutate(all_plate_median = all_plate_median$median) %>%
+  mutate(norm_factor = all_plate_median/per_plate_median) %>%
+  mutate(OD_norm = OD*norm_factor) %>% 
+  dplyr::select(run, assay_date, plate, run_plate, Subject, Antigen, subclass, `Plasma Dilution`, `Antigen Dilution`, norm_factor, OD, OD_norm) %>%
+  group_by(run, assay_date, plate, run_plate, Subject, Antigen, subclass,`Plasma Dilution`, `Antigen Dilution`, norm_factor) %>%
+  summarize(median_OD = median(OD), median_norm_OD = median(OD_norm)) %>%
+  drop_na(median_norm_OD)
+```
+
+## Determine mean and st dev of US donors for each antigen and subclass
+
+```{r determine NAC mean and sd}
+all_runs_norm_factor_NACs <- all_runs_norm_factor %>%
+  filter(grepl("IUHM",Subject))
+
+print(paste0("There are ", length(unique(all_runs_norm_factor_NACs$Subject)), " North American controls."))
+
+all_runs_norm_factor_NACs <- all_runs_norm_factor_NACs %>%
+  filter(subclass != "AMA total IgG") %>%
+  group_by(Antigen, subclass) %>%
+  summarize(NAC_mean = mean(median_norm_OD), NAC_sd = sd(median_norm_OD)) %>%
+  ungroup() %>%
+  mutate(mean_2SD = NAC_mean + 2*NAC_sd) %>%
+  mutate(mean_3SD = NAC_mean + 3*NAC_sd) %>%
+  pivot_longer(cols = c(mean_2SD, mean_3SD), names_to = "cutoff_threshold", values_to = "cutoff")
+
+knitr::kable(all_runs_norm_factor_NACs)
+```
+
+## Join NAC cutoffs to normalized OD data and determine arbitrary units and seropositivity
+
+```{r get AU and seropositivity}
+all_runs_norm_factor_seropos <- all_runs_norm_factor %>%
+  filter(subclass != "AMA total IgG") %>%
+  left_join(., all_runs_norm_factor_NACs,
+            by = c("Antigen","subclass"), relationship = "many-to-many") %>%
+  mutate(AU = median_norm_OD/cutoff) %>%
+  mutate(seropos = ifelse(AU>1, 1, 0))
+```
+
+## Determine seroprevalence by antigen and subclass
+
+```{r determine seroprevalence by ag and subclass}
+Ag_NA_ERROR <- all_runs_norm_factor_seropos %>%
+  filter(is.na(Antigen) | Antigen == "#ERROR!")
+
+all_runs_norm_factor_seroprev <- all_runs_norm_factor_seropos %>%
+  filter(!is.na(Subject)) %>%
+  group_by(Antigen, subclass, cutoff_threshold) %>%
+  summarize(n = n(), positive = sum(seropos), seroprevalence = signif(sum(seropos)/n(), 3))
+
+all_runs_norm_factor_seroprev %>%
+  knitr::kable()
+```
+
+### Plot seroprevalence by antigen and subclass
+
+```{r plot seroprevalance by ag and subclass, fig.align='center', fig.width=12, fig.height=4}
+subclass_seroprev_plot <- all_runs_norm_factor_seroprev %>%
+ filter(subclass != "total IgG") %>%
+  ggplot(., aes(x = Antigen, y =seroprevalence, group = subclass, fill = subclass)) +
+  geom_bar(position="dodge", stat="identity") +
+  ggsci::scale_fill_npg() +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw() +
+  facet_wrap(~cutoff_threshold, nrow = 1)
+
+subclass_seroprev_plot
+```
+
+
+```{r save asubclass_seroprev_plot, eval=FALSE, echo=FALSE}
+png(filename = "/Users/tuantran/Library/CloudStorage/GoogleDrive-tuantran@iu.edu/Shared drives/[Sec] IN-MED-INF-TRANLAB/Tran Lab Shared/Projects/R03 PfMAAP and falstatin/Subclass QC Analytics/R03 Seroprevalence by Ag and subclass.png", res = 300, height = 4, width = 12, units = "in")
+subclass_seroprev_plot
+dev.off()
+```

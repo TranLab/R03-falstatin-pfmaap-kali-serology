@@ -1,0 +1,221 @@
+---
+title: "R03 falstatin MSP36 June 2020 data analyses"
+author: "Tuan M. Tran"
+date: "6/7/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dplyr)
+```
+
+## Purpose
+
+Analyses and figures for June 2020 R03 focused on falstatin and MSP3.6
+
+```{r plots}
+# pheno.plus <- readxl::read_excel("/Users/tuantran/Box Sync/Tran Lab Shared/Projects/K08 Defining Malaria Immunity Using Systems Biology/Sample Lists for Clinical and #Sterile Immunity/Tuan K08 Resubmission Aim 1 Clinical Immunity - Reserved n111 PD 500 SORTED.xlsx")
+
+library(tidyverse)
+library(dplyr)
+
+load("/Users/tuantran/Box Sync/Grant Applications/NIAID R03 June 2020 MSP3.6 and falstatin/R03 Figures and Analyses/K08 Clinical Immunity IgG normalized intensity Expression Sets_aditi.RData")
+pheno <- pData(igg.eset) %>%
+  rownames_to_column('Sample.ID') %>%
+  select(D45, M0, subj_id, Age, Gender, urine_Sh, Hb.type, pfpcr, NumberMalEpisodes, EpisodesCat, EpisodesCat2) %>%
+  rename(Subject.ID = D45, Timepoint = M0, Class = EpisodesCat2)
+
+foo <- exprs(igg.eset) %>%
+  as.data.frame() %>%
+  mutate(antigen = fData(igg.eset)[,2])%>%
+  filter(antigen %in% c("PF10_0351.1o1","PFI0580c-e2")) %>%
+  pivot_longer(cols = -antigen, names_to = "Sample.ID") %>%
+  pivot_wider(names_from = "antigen") %>%
+  rename(falstatin = 'PFI0580c-e2', MSP3.6 = 'PF10_0351.1o1') %>%
+  mutate(Subject.ID = gsub("\\_.*", "", Sample.ID), Timepoint = paste0("M", gsub(".*\\_", "", Sample.ID))) %>%
+  full_join(.,pheno, by = c("Subject.ID", "Timepoint"))  %>%
+  pivot_longer(cols = c(falstatin, MSP3.6), names_to = "Antigen", values_to = "FI")
+
+foo %>%
+  filter(Timepoint == "M0" & NumberMalEpisodes != 3) %>%
+  ggplot(., aes(x = Class, log10(FI), fill = Class)) +
+    geom_violin(draw_quantiles =0.25) +
+    facet_wrap(~Antigen) +
+    theme_bw()
+
+foo %>%
+  filter(Timepoint == "M0") %>%
+  ggplot(., aes(x = NumberMalEpisodes, log10(FI))) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    facet_wrap(~Antigen) +
+    theme_bw()
+
+foo %>%
+  filter(Timepoint == "M0") %>%
+  ggplot(., aes(x = Age, log10(FI), group = Class, color = Class)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    facet_wrap(~Antigen) +
+    theme_bw()
+
+foo1 <- foo %>%
+  filter(Timepoint == "M0" & NumberMalEpisodes != 3) %>%
+  filter(Antigen == "falstatin")
+  summary(factor(foo1$Class))
+#add states
+library(ggpubr)
+library(RColorBrewer)
+  
+foo %>%
+  filter(Timepoint == "M0" & NumberMalEpisodes != 3) %>%
+  filter(Antigen == "falstatin") %>%
+  as.data.frame() %>%
+  compare_means(FI ~ Class, data = ., method = "t.test")
+
+
+foo %>%
+  filter(Timepoint == "M0" & NumberMalEpisodes != 3) %>%
+  filter(Antigen == "MSP3.6") %>%
+  as.data.frame() %>%
+  compare_means(FI ~ Class, data = ., method = "t.test")
+
+cairo_pdf("~/Box Sync/Grant Applications/NIAID R03 June 2020 MSP3.6 and falstatin/R03 Figures and Analyses/Falstatin and MSP36 violin plots ttest log10.pdf", width = 6, height = 4)
+foo %>%
+  filter(Timepoint == "M0" & NumberMalEpisodes != 3) %>%
+  ggplot(., aes(x = Class, log10(FI), fill = Class)) +
+    geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+    stat_compare_means( aes(label = ..p.signif..), method = "t.test") +
+    scale_fill_brewer(palette = "Set1") +
+    ylab("log10(FI) at enrollment") +
+    xlab("malaria episodes over ensuing 3 years") +
+    facet_wrap(~Antigen) +
+    theme_bw() +
+    theme(legend.position = "none", axis.text=element_text(size=14),
+        axis.title=element_text(size=15), strip.text.x = element_text(size = 15, colour = "black"),
+        strip.background = element_rect(fill="white"))
+dev.off()
+```
+
+```{r make Table 1, fig.width=16}
+foo1 <- foo %>%
+  filter(Timepoint == "M0" & NumberMalEpisodes != 3) %>%
+  filter(Antigen == "falstatin") %>%
+  rename('status' = pfpcr) %>%
+  mutate(status = recode(status, '1' = "PCR+", '0' = "PCR-"))
+#%>%
+#  mutate(Class = recode(Class, '< 3 episodes' = "protected (< 3 episodes)", '> 3 episodes' = "susceptible (> 3   episodes)"))
+
+library(table1)
+label(foo1$Gender) <- "Sex"
+label(foo1$Age) <- "Age at enrollment"
+label(foo1$status) <- "P. falciparum infection status at enrollment"
+label(foo1$Class) <- "Class"
+mytable <- table1(~ Gender + Age + status | Class, data=foo1)
+
+table1(~ Gender + Age + status | Class, data=foo1)
+```
+
+```{r survival analysis include PCR negative and PCR positive, fig.height= 6, fig.width=8}
+library(survival)
+library(survminer)
+#not significant!
+#limits the time of study to X days, where everyone is censored at X days
+
+survdata <- read.csv("/Users/tuantran/Box Sync/Kalifabougou Data/LIG_06_09_2013/Kali2011_n695_TimeToFirstMalEpisodeOrCensor_NumberOfEpisodes_2500.csv") %>%
+  select(subj_id, clinmal, EnrollDate, FirstMalEpisodeOrCensorDate, TimeToFirstMalEpisodeOrCensor)
+
+MyAntigen <- "falstatin" #"MSP3.6" "falstatin"
+survdata <- foo %>%
+  filter(Timepoint == "M0") %>%
+  full_join(.,survdata, by = "subj_id") %>%
+  rename(time = TimeToFirstMalEpisodeOrCensor) %>%
+  filter(Antigen == MyAntigen)
+survdata$Class <- factor(survdata$Class)
+survdata$quantile <- gtools::quantcut(survdata$FI, 3, labels = c("bottom", "middle", "top"))
+survdata <- survdata %>%
+  filter(quantile != "middle")
+followup			<-	180
+survdata$clinmal	<- 	ifelse(survdata$time > followup & survdata$clinmal==1, 0, survdata$clinmal)
+survdata$time 		<-	ifelse(survdata$time > followup, followup, survdata$time)
+
+sfit <- survfit(Surv(time, clinmal) ~ quantile , data=survdata)
+survdiff(Surv(survdata$time, survdata$clinmal) ~ survdata$quantile)
+print(sfit)
+
+pcrfever.cp <- subset(survdata, select = c(quantile, subj_id, EnrollDate, FirstMalEpisodeOrCensorDate, clinmal, Age))
+pcrfever.cp$quantile <- factor(pcrfever.cp$quantile, levels = c("bottom", "top"))
+pcrfever.cp$start <- as.integer(as.Date(pcrfever.cp$EnrollDate) - as.Date("2011-05-01"))
+pcrfever.cp$stop <- as.integer(as.Date(pcrfever.cp$FirstMalEpisodeOrCensorDate) - as.Date("2011-05-01"))
+subj.pcrp <- rep(pcrfever.cp$start, as.vector(table(pcrfever.cp$subj_id)))
+pcrfever.cp$start1 <- pcrfever.cp$start-subj.pcrp
+pcrfever.cp$stop1 <- pcrfever.cp$stop-subj.pcrp
+cox	<-	coxph(Surv(start1, stop1, clinmal) ~ quantile + Age, data = pcrfever.cp, cluster = subj_id)
+summary(cox)             
+cox.zph(cox)
+
+cairo_pdf(paste0("/Users/tuantran/Box Sync/Grant Applications/NIAID R03 June 2020 MSP3.6 and falstatin/R03 Figures and Analyses/", MyAntigen, " KM plot Enrollment.pdf"), height = 6, width = 6)
+ggsurvplot(sfit, risk.table = TRUE, pval = TRUE, conf.int = TRUE, conf.int.alpha = 0.1, font.family = "Arial", title = MyAntigen,
+           palette = "lancet",break.time.by = 30, main = paste0("Survival by Quantile for ", MyAntigen),
+           xlab = "Days since enrollment",
+           ylab = "% free of febrile malaria",
+           censor = TRUE)
+dev.off()
+```
+
+```{r power anaylsis for Cox proportional hazards}
+library(powerSurvEpi)
+foodat <- data.frame("time" = survdata$time, "status" = survdata$clinmal, age = survdata$Age, group = factor(survdata$quantile, levels = c("bottom","top"), labels = c("C","E")))
+summary(foodat$group)
+powerCT(Surv(time, status) ~ group, foodat, nE = 225, nC = 225, RR = 0.705, alpha = 0.05)$power
+powerCT(Surv(time, status) ~ group, foodat, nE = 225, nC = 225, RR = 0.69, alpha = 0.05)$power
+powerCT(Surv(time, status) ~ group, foodat, nE = 225, nC = 225, RR = 0.68, alpha = 0.05)$power
+```
+
+
+```{r survival analysis infection to fever, fig.height= 6, fig.width=8}
+library(survival)
+library(survminer)
+#not significant!
+#limits the time of study to X days, where everyone is censored at X days
+
+survdata <- read.csv("/Users/tuantran/Box Sync/Kalifabougou Data/LIG_06_09_2013/pcrfever_start_stop_PD0_pfrh5_out.csv") %>%
+  select(subj_id, clinmal, start, avgstop2, stop)
+pcrfever.cp <- survdata
+subj.pcrp <- rep(survdata$start, as.vector(table(pcrfever.cp$subj_id)))
+pcrfever.cp$start1 <- pcrfever.cp$start-subj.pcrp
+pcrfever.cp$stop1 <- pcrfever.cp$stop-subj.pcrp
+
+MyAntigen <- "MSP3.6" #"MSP3.6" "falstatin"
+pcrfever.cp <- foo %>%
+  filter(Timepoint == "M0") %>%
+  right_join(.,pcrfever.cp, by = "subj_id") %>%
+  filter(Antigen == MyAntigen)
+
+pcrfever.cp$quantile <- gtools::quantcut(pcrfever.cp$FI, 3, labels = c("bottom", "middle", "top"))
+pcrfever.cp <- pcrfever.cp %>%
+  filter(quantile != "middle")
+followup			<-	30
+pcrfever.cp$clinmal	<- 	ifelse(pcrfever.cp$stop1 > followup & pcrfever.cp$clinmal==1, 0, pcrfever.cp$clinmal)
+pcrfever.cp$stop1 		<-	ifelse(pcrfever.cp$stop1 > followup, followup, pcrfever.cp$stop1)
+
+sfit <- survfit(Surv(stop1, clinmal) ~ quantile , data=pcrfever.cp)
+survdiff(Surv(pcrfever.cp$stop1, pcrfever.cp$clinmal) ~ pcrfever.cp$quantile)
+print(sfit)
+cairo_pdf(paste0("/Users/tuantran/Box Sync/Grant Applications/NIAID R03 June 2020 MSP3.6 and falstatin/R03 Figures and Analyses/", MyAntigen, " KM plot.pdf"), height = 6, width = 6)
+ggsurvplot(sfit, risk.table = TRUE, pval = TRUE, conf.int = TRUE, conf.int.alpha = 0.1, font.family = "Arial", title = MyAntigen,
+           palette = "lancet",break.time.by = 30, main = paste0("Survival by Quantile for ", MyAntigen),
+           xlab = "Days since parasitemic",
+           ylab = "% free of febrile malaria",
+           censor = TRUE)
+dev.off()
+```
+
+```{r checking samples}
+mysamples <- readxl::read_excel("/Users/tuantran/Box Sync/Grant Applications/NIAID R03 June 2020 MSP3.6 and falstatin/R03 Figures and Analyses/Tuan R03 June 2020 R analyses/All May2011 (m0) Plasma Samples in LIG as of 6-10-2020.xlsx") %>%
+  select(`Subject ID`, Volume)
+```
+
+

@@ -1,0 +1,909 @@
+---
+title: "R03 MSP3.6 (MAAP) and falstatin July 2023 ELISA data analyses"
+author: "Tuan M. Tran"
+date: "07/05/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Purpose
+
+Analyses and figures for falstatin and MSP3.6 antibody study
+
+## Analyse ELISA data
+
+```{r load libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(knitr)
+library(survival)
+library(tab)
+library(survminer)
+library(magrittr)
+```
+
+```{r set paths}
+datadir <- "/Users/tuantran/Library/CloudStorage/OneDrive-IndianaUniversity/Manuscripts/R03 falstatin and MSP3.6 manuscripts/R03 falstatin and msp3.6/"
+figdir <- "/Users/tuantran/Library/CloudStorage/OneDrive-IndianaUniversity/Conferences/ASTMH 2023/Oscar Poster/Tuan Figures for Oscar/"
+```
+
+```{r read in data locally, message=FALSE, warning=FALSE}
+main_df <- readRDS(paste0(datadir, "falstatin_msp36_data_07072023.rds")) %>%
+  mutate(antigen = gsub("falst N term conserved V2", "falstatin_110_125", antigen)) %>%
+  mutate(antigen = gsub("falstatin 289-335", "falstatin_289_335", antigen)) %>%
+  mutate(antigen = gsub("\\<falstatin\\>", "falstatin_FL", antigen,)) %>%
+  mutate(antigen = gsub("MSP N Term conserved", "MAAP_34_57", antigen)) %>%
+  mutate(antigen = gsub("MSP N Term", "MAAP_22_143", antigen)) %>%
+  mutate(antigen = factor(antigen))
+```
+
+```{r read in data from google drive}
+temp <- tempfile(fileext = ".rds")
+dl <- drive_download(
+  as_id("1Q6kLfFDU6s7WD2J39Eq8ReY6DQ8q_RUm"), path = temp, overwrite = TRUE)
+main_df <- readRDS(file = dl$local_path) %>%
+  mutate(antigen = gsub("falst N term conserved V2", "falstatin_110_125", antigen)) %>%
+  mutate(antigen = gsub("falstatin 289-335", "falstatin_289_335", antigen)) %>%
+  mutate(antigen = gsub("\\<falstatin\\>", "falstatin_FL", antigen,)) %>%
+  mutate(antigen = gsub("MSP N Term conserved", "MAAP_34_57", antigen)) %>%
+  mutate(antigen = gsub("MSP N Term", "MAAP_22_143", antigen)) %>%
+  mutate(antigen = factor(antigen))
+```
+
+## Normalize data
+
+- group by plate
+- assess positive control
+- determine median of all positive controls, global_positive_control_median
+- multiply each plate by normalization factor to get positive control to median
+
+```{r quality control}
+#summary(factor(main_df$plate_number))
+pos_control_summary <- main_df %>%
+  group_by(plate_number) %>%
+  filter(group_type == "P17_AMA1_pos_con") %>%
+  dplyr::summarize(n = n(), mean_pos_con=mean(adj_od), stdev=sd(adj_od), cv=sd(adj_od)/mean(adj_od)) %>%
+  ungroup() %>%
+  mutate(cv_above_10pct = ifelse(cv>0.1, "*",""))
+
+#check pos_control_summary dataframe for positive controls that are suspect
+
+#positive controls with CV>10%
+pos_control_summary %>%
+  filter(cv_above_10pct == "*") %>%
+  kable()
+```
+
+## Normalize plates
+
+```{r normalize plates}
+pos_control_normalization_factors <- pos_control_summary %>%
+  mutate(global_positive_control_median = median(.$mean_pos_con)) %>%
+  mutate(normalization_factor = global_positive_control_median/mean_pos_con) %>%
+  mutate(check_factor = ifelse((mean_pos_con*normalization_factor)==global_positive_control_median, "all good", "please check again"))
+
+normalized_dat <- main_df %>%
+  left_join(., pos_control_normalization_factors %>%
+              dplyr::select(plate_number, normalization_factor),
+            by = "plate_number") %>%
+  mutate(normalized_od = adj_od*normalization_factor) %>%
+  group_by(assay_date, plate_name, plate_number, group_name, group_type, subj_id, antigen) %>%
+  dplyr::summarize(mean_norm_od = mean(normalized_od)) %>%
+  ungroup() %>%
+  arrange(assay_date, plate_name, plate_number, subj_id, antigen, subj_id, antigen) %>%
+  mutate(index = 1:nrow(.)) %>%
+  dplyr::select(index, everything())
+```
+
+## Subset BSA and then re-join by plate_name and subject to subtract BSA from antigen
+
+```{r bsa control}
+bsa_normalized_dat <- normalized_dat %>%
+  filter(antigen == "BSA") %>%
+  dplyr::select(plate_name, subj_id, mean_norm_od) %>%
+  dplyr::rename(mean_norm_od_bsa = mean_norm_od)
+
+normalized_dat <- normalized_dat %>%
+  left_join(., bsa_normalized_dat,
+            by = c("plate_name","subj_id")) %>%
+  mutate(bsa_subtr_mean_norm_od = mean_norm_od-mean_norm_od_bsa) %>%
+  mutate(bsa_subtr_mean_norm_od = ifelse(bsa_subtr_mean_norm_od<0, 0, bsa_subtr_mean_norm_od))
+```
+
+## Check IUHM samples to ensure they are malaria naive
+
+By looking at all the replicate plates, you can clearly see which are true outliers and remove the samples that are technical errors.
+
+```{r check IUHM samples}
+#here is where you inspect all IUHM samples to see which ones were aberrant
+neg_con_dat <- normalized_dat %>%
+  filter(group_type == "naive_neg_con") %>%
+  group_by(index, assay_date, plate_name, subj_id, antigen) %>%
+  dplyr::select(index, assay_date, plate_name, subj_id, antigen, mean_norm_od) %>%
+  dplyr::summarize(mean_norm_od=mean(mean_norm_od),
+            sd_norm_od=sd(mean_norm_od),
+            cv_norm_od=(sd(mean_norm_od)/mean(mean_norm_od)))
+
+#check for outliers amongst IUHM replicates
+potential_outliers <- neg_con_dat %>%
+  filter(mean_norm_od>0.075)
+
+potential_outliers %>%
+  kable()
+```
+
+```{r plot all replicates of subject with potential outliers, fig.align='center', fig.height=10, fig.width=12}
+
+potental_outliers_plot <- neg_con_dat %>%
+  filter(antigen != "BSA") %>%
+  filter(subj_id %in% potential_outliers$subj_id) %>%
+  ggplot(., aes(x = subj_id, y = plate_name, fill = mean_norm_od)) +
+  geom_tile(colour="white",  width=1) +
+  coord_fixed() +
+  viridis::scale_fill_viridis(discrete=FALSE) +
+  hrbrthemes::theme_ipsum() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 6),
+        axis.text.y = element_text(size = 5)) +
+  scale_x_discrete(expand=c(0,0))+
+  scale_y_discrete(expand=c(0,0)) +
+  facet_wrap(~antigen, ncol = 5)
+
+potental_outliers_plot
+```
+
+By looking at all the replicate plates, you can clearly see which are true outliers (lighter green and yellow box surrounded by purple) and remove the samples that are obvious technical errors.
+
+## Define seropositivity threshold
+
+```{r define seropositivity threshold}
+neg_control_dat <-  normalized_dat %>%
+  filter(group_type == "naive_neg_con") %>%
+  filter(subj_id != "IUHM001") %>%
+  filter(index != "332") %>% #use index from potential_outliers df
+  filter(index != "2427") #use index from potential_outliers df
+
+unique(neg_control_dat$subj_id)
+length(unique(neg_control_dat$subj_id))
+
+unexposed_control_stats <- normalized_dat %>%
+  filter(group_type == "naive_neg_con") %>%
+  filter(subj_id != "IUHM001") %>%
+  filter(index != "940") %>%
+  group_by(antigen) %>%
+  dplyr::summarize(mean=mean(mean_norm_od),
+            stdev=sd(mean_norm_od),
+            sero_pos_thres=mean(mean_norm_od)+3*sd(mean_norm_od))
+
+seropositivity_cutoff <- unexposed_control_stats %>%
+  dplyr::select(antigen, sero_pos_thres)
+```
+
+## Merge normalized data with seropositivity cutoff and calculate seropositivity
+
+```{r merge normalize dat with seropositivity cutoff, message=FALSE, warning=FALSE}
+normalized_seropos_dat <- normalized_dat %>%
+  #manually change typo's in three Kali subject IDS
+  mutate(subj_id = ifelse(subj_id == "Kali66", "Kali066", subj_id)) %>%
+  mutate(subj_id = ifelse(subj_id == "kali183", "Kali183", subj_id)) %>%
+  mutate(subj_id = ifelse(subj_id == "Kali0608", "Kali608", subj_id)) %>%
+  dplyr::select(-c(index, assay_date, plate_name, plate_number)) %>%
+  group_by(subj_id, antigen) %>%
+  dplyr::summarize(mean_norm_od = mean(mean_norm_od),
+            bsa_subtr_mean_norm_od = mean(bsa_subtr_mean_norm_od)) %>%
+  ungroup() %>%
+  left_join(., seropositivity_cutoff,
+            by = "antigen") %>%
+  mutate(AU_no_bsa_subtr = mean_norm_od/sero_pos_thres) %>%
+  mutate(seropositive_no_bsa_subtr = ifelse(AU_no_bsa_subtr>1, 1, 0)) %>%
+  mutate(AU_bsa_subtr = bsa_subtr_mean_norm_od/sero_pos_thres) %>%
+  mutate(seropositive_bsa_subtr = ifelse(AU_bsa_subtr>1, 1, 0)) %>%
+  filter(subj_id != "IUHM001") %>%
+  filter(subj_id != "PP17")
+```
+
+## Merge with metadata
+
+```{r merge with metadata, message=FALSE, warning=FALSE}
+baseline_metadata <- readxl::read_xlsx("/Users/tuantran/Library/CloudStorage/OneDrive-IndianaUniversity/Kalifabougou Data/Read-in Data for Data Management/enroll_2011_data_FINAL_pcr_smear_helminth_Hbtype_2015-06-09-10-AM copy.xlsx") %>%
+  dplyr::select(subj_id, calc.age, Gender, Ethnicity, Hb.type, pfpcr, Pf_smear_enroll) %>%
+  dplyr::rename(age = calc.age,
+                gender = Gender,
+                ethnicity = Ethnicity,
+                hb_type = Hb.type) %>%
+  mutate(pf_status_enroll = ifelse(pfpcr == 1 | Pf_smear_enroll == 1, 1, 0))  %>%
+  dplyr::select(-c(pfpcr, Pf_smear_enroll)) %>%
+  mutate(subj_id = paste0("Kali", sprintf("%03s", subj_id))) %>%
+  mutate(age = as.numeric(age)) %>%
+  mutate(agegrp = factor(cut(age, c(0, 0.499, 1.999, 3.999, 6.999, 9.999, 14.999, 26),
+                      label = c("3 - 5 mos", "6 mos - 1 y", "2 - 3 y", "4 - 6 y", "7 - 9 y", "10 - 14 y", "15 - 25 y")))) %>%
+  drop_na(age)
+  
+normalized_seropos_meta_dat <- normalized_seropos_dat %>%
+  left_join(., baseline_metadata,
+            by = c("subj_id")) %>%
+  mutate(agegrp = ifelse(grepl("IUHM", subj_id), "US naive", as.character(agegrp))) %>%
+  mutate(agegrp = factor(agegrp, levels = c("3 - 5 mos", "6 mos - 1 y", "2 - 3 y", "4 - 6 y", "7 - 9 y", "10 - 14 y", "15 - 25 y", "US naive")))
+
+n_agegrp <- normalized_seropos_meta_dat %>%
+  dplyr::select(subj_id, antigen, agegrp) %>%
+  distinct(subj_id, antigen, agegrp) %>%
+  group_by(antigen, agegrp) %>%
+  dplyr::summarize(n_agegrp = n()) %>%
+  drop_na(agegrp)
+
+normalized_seropos_meta_dat <- normalized_seropos_meta_dat %>%
+  left_join(., n_agegrp,
+            by = c("antigen","agegrp")) %>%
+  mutate(agegrp_n = factor(paste0(as.character(agegrp), " (",n_agegrp, ")"),
+                           levels = c("3 - 5 mos (27)",
+                                      "6 mos - 1 y (58)",
+                                      "2 - 3 y (55)",
+                                      "4 - 6 y (81)",
+                                      "7 - 9 y (245)",
+                                      "10 - 14 y (84)",
+                                      "15 - 25 y (28)",
+                                      "US naive (14)")))
+
+```
+
+```{r plot by sex, fig.align='center', fig.height=3, fig.width=6, eval=FALSE, include=FALSE}
+normalized_seropos_meta_dat %>%
+  filter(antigen != "AMA") %>%
+  filter(antigen != "BSA") %>%
+  drop_na(bsa_subtr_mean_norm_od, gender) %>%
+  ggplot(., aes(x = gender, y = mean_norm_od)) +
+  geom_boxplot() +
+  theme_bw() +
+  facet_wrap(~antigen, scales = "free_y")
+
+# normalized_seropos_meta_dat %>%
+#   filter(antigen != "AMA") %>%
+#   filter(antigen != "BSA") %>%
+#   drop_na(bsa_subtr_mean_norm_od, gender) %>%
+#   writexl::write_xlsx(., path = "/Users/tuantran/Library/CloudStorage/OneDrive-IndianaUniversity/Manuscripts/R03 falstatin and MSP3.6 manuscripts/R03 falstatin and msp3.6/R03_falstatin_PfMAAP_seropositivity_long.xlsx")
+```
+
+## Plot OD boxplots by age group for each antigen
+
+```{r plot od vs age, eval=FALSE}
+od_vs_age <- normalized_seropos_meta_dat %>%
+  filter(antigen != "AMA") %>%
+  filter(antigen != "BSA") %>%
+  drop_na(bsa_subtr_mean_norm_od, age) %>%
+  ggplot(., aes(x = age, y = bsa_subtr_mean_norm_od)) +
+  geom_point() +
+  theme_bw() +
+  facet_wrap(~antigen)
+```
+
+```{r plot OD by agegroup by antigen, fig.align='center', fig.height=5, fig.width=10}
+
+OD_agegrp_antigen_boxplot <- normalized_seropos_meta_dat %>%
+  filter(antigen != "AMA") %>%
+  filter(antigen != "BSA") %>%
+  drop_na(agegrp_n, mean_norm_od) %>%
+  ggplot(., aes(x = agegrp_n, y = mean_norm_od, color = agegrp_n)) +
+  geom_boxplot(alpha = 0.6, aes(fill= agegrp_n)) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  xlab("age group (n)") +
+  ylab("normalized OD") +
+  facet_wrap(~antigen, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size=10),
+        axis.title = element_text(size = 12),
+        strip.background = element_blank(),
+        strip.text = element_text(size = 12),
+        legend.position = "none") +
+  theme(panel.spacing = unit(2, "lines"))
+
+
+OD_agegrp_antigen_boxplot
+```
+
+
+```{r save OD_agegrp_antigen_boxplot}
+pdf(file = paste0(figdir, "Figure 1 OD by antigen by agegroup.pdf"), width = 10, height = 5)
+OD_agegrp_antigen_boxplot
+dev.off()
+```
+### Use Jonckheere Terpstra Test to test for ordered differences among age groups
+
+https://en.wikipedia.org/wiki/Jonckheere%27s_trend_test
+
+```{r JonckheereTerpstraTest, message=FALSE, warning=FALSE}
+jonckheere_res <- normalized_seropos_meta_dat %>%
+  filter(antigen != "AMA") %>%
+  filter(antigen != "BSA") %>%
+  filter(agegrp_n != "US naive (14)") %>%
+  drop_na(agegrp_n, mean_norm_od) %>%
+  droplevels() %>%
+  group_by(antigen) %>%
+  group_modify(~broom::tidy(DescTools::JonckheereTerpstraTest(mean_norm_od~agegrp_n, data = .x, alternative = "increasing", nperm=1000))) %>%
+  ungroup() %>%
+  mutate(p.adj = p.adjust(p.value, method = "bonferroni"))
+
+jonckheere_res %>%
+  kable()
+```
+
+
+## Plot seroprevalence for each antigen
+
+### Overall seropositivity for each antigen
+
+```{r plot seroprevalence overall, fig.align='center', fig.height=5, fig.width=10}
+n_antigen <- normalized_seropos_meta_dat %>%
+  filter(antigen != "AMA") %>%
+  filter(antigen != "BSA") %>%
+  filter(grepl("Kali", subj_id)) %>%
+  group_by(antigen) %>%
+  dplyr::summarize(n=n())
+
+seroprevalence_overall_antigen_plot_dat <- normalized_seropos_meta_dat %>%
+  filter(antigen != "AMA") %>%
+  filter(antigen != "BSA") %>%
+  filter(grepl("Kali", subj_id)) %>%
+  drop_na(agegrp_n, mean_norm_od) %>%
+  dplyr::select(subj_id, antigen, seropositive_no_bsa_subtr) %>%
+  group_by(antigen) %>%
+  dplyr::summarise(seropositive = sum(seropositive_no_bsa_subtr)) %>%
+  mutate(seroprevalence = seropositive/578)
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442")
+library(wesanderson)
+pal <- wes_palette(5, name = "Darjeeling2", type = "discrete")
+
+seroprevalence_overall_antigen_plot <- seroprevalence_overall_antigen_plot_dat %>%
+  mutate(label = paste0(signif(seroprevalence*100, digits = 3), "%")) %>%
+  ggplot(., aes(x = fct_reorder(antigen, desc(seroprevalence)), y = seroprevalence, fill = antigen)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label=label), vjust=-0.3) +
+  theme_bw() +
+  ggtitle("all participants by antigen") +
+  xlab("antigen") +
+  ylab("seroprevalence (n=578)") +
+  scale_fill_manual(values=pal) +
+  scale_color_manual(values=pal) +
+  theme(plot.title = element_text(size = 14, hjust = 0.5),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size=12),
+        axis.title = element_text(size = 12),
+        legend.position = "none") +
+  scale_y_continuous(labels = scales::percent)
+
+seroprevalence_overall_antigen_plot
+```
+
+### Seropositivity by age group for each antigen
+
+```{r plot seroprevalence by agegrp, fig.align='center', fig.height=5, fig.width=10}
+seroprevalence_agegrp_antigen_plot_dat <- normalized_seropos_meta_dat %>%
+  filter(antigen != "AMA") %>%
+  filter(antigen != "BSA") %>%
+  filter(grepl("Kali", subj_id)) %>%
+  drop_na(agegrp_n, mean_norm_od) %>%
+  dplyr::select(subj_id, antigen,seropositive_bsa_subtr,seropositive_no_bsa_subtr,age,gender,ethnicity,n_agegrp, agegrp_n) %>%
+  group_by(agegrp_n, antigen, n_agegrp) %>%
+  summarise(seropositive = sum(seropositive_no_bsa_subtr)) %>%
+  mutate(seroprevalence = seropositive/n_agegrp)
+
+seroprevalence_agegrp_antigen_plot <- seroprevalence_agegrp_antigen_plot_dat %>%
+  mutate(label = paste0(signif(seroprevalence*100, digits = 3), "%")) %>%
+  ggplot(., aes(x = agegrp_n, y = seroprevalence, fill = agegrp_n)) +
+  geom_bar(stat = "identity") +
+  xlab("age group (n)")+
+  geom_text(aes(label=label), vjust=-0.3, size = 3) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  facet_wrap(~antigen) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size=10),
+        axis.title = element_text(size = 14),
+        strip.background = element_blank(),
+        strip.text = element_text(size = 14),
+        legend.position = "none")
+
+seroprevalence_agegrp_antigen_plot +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0.05, 0.15))) +
+  theme(panel.spacing = unit(3, "lines"))
+```
+#### Arrange seroprevalence by age with overall seroprevalence by antigen
+
+```{r plot seroprevalence as antigen and arrange, fig.align='center', fig.width=12, fig.height=6}
+seroprevalence_plot_list <- c()
+for(i in unique(foo$antigen)){
+  seroprevalence_plot_list[[i]] <- seroprevalence_agegrp_antigen_plot_dat %>%
+    mutate(label = paste0(signif(seroprevalence*100, digits = 3), "%")) %>%
+    filter(antigen == i) %>%
+    ggplot(., aes(x = agegrp_n, y = seroprevalence, fill = agegrp_n)) +
+    geom_bar(stat = "identity") +
+    xlab("")+
+    ylab("") +
+    geom_text(aes(label=label), vjust=-0.3, size = 3) +
+    scale_fill_brewer(palette = "Dark2") +
+    scale_color_brewer(palette = "Dark2") +
+    theme_bw() +
+    facet_wrap(~antigen) +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size=10),
+          axis.title = element_text(size = 14),
+          strip.background = element_blank(),
+          strip.text = element_text(size = 14),
+          legend.position = "none") +
+    scale_y_continuous(labels = scales::percent, limits = c(0,1)) +
+    theme(panel.spacing = unit(2, "lines"))
+}
+for(i in 1:3){
+  seroprevalence_plot_list[[i]] <- seroprevalence_plot_list[[i]] +
+    theme(axis.text.x = element_blank())
+}
+
+seroprevalence_overall_antigen_plot2 <- seroprevalence_overall_antigen_plot +
+  scale_y_continuous(labels = scales::percent, limits = c(0,1)) +
+  theme(axis.text.x = element_text(size = 9.8))
+ggarrange(seroprevalence_plot_list$falstatin_110_125,
+          seroprevalence_plot_list$falstatin_289_335,
+          seroprevalence_plot_list$falstatin_FL,
+          seroprevalence_plot_list$MAAP_22_143,
+          seroprevalence_plot_list$MAAP_34_57,
+          seroprevalence_overall_antigen_plot2,
+          ncol=3, nrow=2,
+          heights = c(1,1.33),
+          align = "hv")
+```
+
+```{r save all seroprevalence by agegroup by antigen plots}
+pdf(file = paste0(figdir, "Fig 2 All seroprevalence by agegroup by antigen.pdf"), width = 10, height = 5.5)
+ggarrange(seroprevalence_plot_list$falstatin_110_125,
+          seroprevalence_plot_list$falstatin_289_335,
+          seroprevalence_plot_list$falstatin_FL,
+          seroprevalence_plot_list$MAAP_22_143,
+          seroprevalence_plot_list$MAAP_34_57,
+          seroprevalence_overall_antigen_plot2,
+          ncol=3, nrow=2,
+          heights = c(1,1.33),
+          align = "hv")
+dev.off()
+```
+
+## Merge with survival data
+
+Prepare seropositivity data for survival analysis
+
+```{r prepare seropositivity data}
+seropos_meta_dat_for_surv <- normalized_seropos_meta_dat %>%
+  filter(grepl("Kali", subj_id)) %>%
+  filter(antigen != "BSA") %>%
+  dplyr::select(subj_id, age, gender, ethnicity, agegrp, agegrp_n, pf_status_enroll, hb_type, seropositive_bsa_subtr, antigen) %>%
+  mutate(antigen = gsub(" ","_", antigen)) %>%
+  mutate(antigen = gsub("-","_", antigen)) %>%
+  pivot_wider(names_from = antigen, values_from = seropositive_bsa_subtr)
+  
+```
+
+### Assess protection over first malaria season
+
+```{r cox analysis first malaria season }
+new_survdata_clinmal <- readRDS("/Users/tuantran/OneDrive - Indiana University/Manuscripts/Manuscript_p53 polymorphisms and malaria risk_JB/Figures and tables for manuscript/Kali-TP53-polymorphism/clinmal_survdata.rds") %>%
+  mutate(subj_id = paste0("Kali", sprintf("%03s", as.character(subj_id))))
+
+new_survdata_clinmal_2011 <- left_join(seropos_meta_dat_for_surv %>%
+                                         mutate(pf_status_enroll = factor(pf_status_enroll,
+                                                                          levels = c(0,1),
+                                                                          labels = c("neg","pos"))) %>%
+                                         mutate(hb_type = factor(ifelse(grepl("S", hb_type), "HbS", "non-HbS"), levels = c("non-HbS", "HbS"))) %>%
+                                         droplevels(),
+                                  new_survdata_clinmal,
+                                  by = "subj_id") %>%
+  filter(days_to_clinmal>1)
+
+#Censor at XXX day follow up
+followup.time <- 210
+PD <- 2500
+coxph_dat_2011 <- new_survdata_clinmal_2011  %>%
+  mutate(clinmal = ifelse(days_to_clinmal > followup.time, 0, clinmal)) %>%
+  mutate(days_to_clinmal = ifelse(days_to_clinmal > followup.time, followup.time, days_to_clinmal))
+
+cox_falstatin_FL_2011 <- coxph(Surv(days_to_clinmal, clinmal) ~ age + pf_status_enroll + hb_type + falstatin_FL, data = coxph_dat_2011, robust = TRUE)
+cox_falstatin_110_125_2011 <- coxph(Surv(days_to_clinmal, clinmal) ~ age + pf_status_enroll + hb_type + falstatin_110_125, data = coxph_dat_2011, robust = TRUE)
+cox_falstatin_289_335_2011 <- coxph(Surv(days_to_clinmal, clinmal) ~ age + pf_status_enroll + hb_type + falstatin_289_335, data = coxph_dat_2011, robust = TRUE)
+cox_MAAP_22_143_2011 <- coxph(Surv(days_to_clinmal, clinmal) ~ age + pf_status_enroll + hb_type + MAAP_22_143, data = coxph_dat_2011, robust = TRUE)
+cox_MAAP_34_57_2011 <- coxph(Surv(days_to_clinmal, clinmal) ~ age + pf_status_enroll + hb_type + MAAP_34_57, data = coxph_dat_2011, robust = TRUE)
+```
+
+Check if PH assumptions are met
+
+```{r check cox zph cox 2011 fit}
+cox.zph(cox_falstatin_FL_2011)
+cox.zph(cox_falstatin_110_125_2011)
+cox.zph(cox_falstatin_289_335_2011)
+cox.zph(cox_MAAP_22_143_2011)
+cox.zph(cox_MAAP_34_57_2011)
+```
+
+View results of Cox PH fit
+
+```{r tables for cox 2011 fit}
+tabcoxph(cox_falstatin_FL_2011, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(cox_falstatin_110_125_2011, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(cox_falstatin_289_335_2011, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(cox_MAAP_22_143_2011, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(cox_MAAP_34_57_2011, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+```
+## Assess protection over 3 malaria seasons
+
+Read in 3-year malaria data
+
+https://cran.r-project.org/web/packages/survival/vignettes/timedep.pdf
+
+
+```{r merge with survival data}
+complete_visits_2011_2019 <- read_delim("/Users/tuantran/Library/CloudStorage/OneDrive-IndianaUniversity/Kalifabougou Data/Read-in Data for Data Management/LIG_Complete_Visit_Listing_Tuan_01242019.txt", delim = "\t") %>%
+  mutate(Visit_Date = as.Date(Visit_Date, format = "%d%B%Y")) %>%
+  dplyr::rename(subj_id = SubjectID) %>%
+  mutate(subj_id = paste0("Kali", sprintf("%03s", subj_id)))
+
+complete_visits_2011_2014 <- complete_visits_2011_2019 %>%
+  filter(Visit_Date < as.Date("2014-02-01")) %>%
+  mutate(mal_episode = ifelse(Parasite_Density>2500 & Temperature >= 37.5, 1, 0)) %>%
+  arrange(subj_id, Visit_Date,Temperature, mal_episode) %>%
+  drop_na(Temperature)
+
+start_visits <- complete_visits_2011_2014 %>%
+  dplyr::select(subj_id, Visit_Date) %>%
+  group_by(subj_id) %>%
+  slice_min(Visit_Date) %>%
+  ungroup() %>%
+  arrange(subj_id) %>%
+  dplyr::rename(start_date = "Visit_Date") %>%
+  distinct(subj_id, start_date)
+
+last_visits <- complete_visits_2011_2014 %>%
+  dplyr::select(subj_id, Visit_Date) %>%
+  group_by(subj_id) %>%
+  slice_max(Visit_Date) %>%
+  ungroup() %>%
+  arrange(subj_id) %>%
+  dplyr::rename(end_date = "Visit_Date") %>%
+  distinct(subj_id, end_date)
+
+complete_visits_2011_2014_wide <- complete_visits_2011_2014 %>%
+  distinct(subj_id, Visit_Date, mal_episode) %>%
+  left_join(., start_visits,
+            by = "subj_id") %>%
+  left_join(., last_visits,
+            by = "subj_id") %>%
+  mutate(days_from_enrollment = as.integer(Visit_Date - start_date)) %>%
+  mutate(followup_time = as.integer(end_date-start_date)) 
+
+mal_visits_2011_2014_wide <- complete_visits_2011_2014_wide %>% 
+  filter(mal_episode==1) %>%
+  group_by(subj_id) %>%
+  mutate(rownumber = row_number()) %>%
+  summarize(event_time = paste0("etime", rownumber), days_from_enrollment = days_from_enrollment) %>%
+  ungroup() %>%
+  pivot_wider(names_from = event_time, values_from = days_from_enrollment)
+
+complete_visits_2011_2014_wide <- complete_visits_2011_2014_wide %>%
+  filter(days_from_enrollment == 0) %>%
+  dplyr::select(subj_id, start_date, end_date, followup_time) %>%
+  left_join(., mal_visits_2011_2014_wide,
+            by = "subj_id")
+
+complete_visits_2011_2014_wide <- seropos_meta_dat_for_surv %>%
+  mutate(pf_status_enroll = factor(pf_status_enroll,
+                                   levels = c(0,1),
+                                   labels = c("neg","pos"))) %>%
+  mutate(hb_type = factor(ifelse(grepl("S", hb_type), "HbS", "non-HbS"), levels = c("non-HbS", "HbS"))) %>%
+  droplevels() %>%
+  left_join(., complete_visits_2011_2014_wide,
+            by = "subj_id") %>%
+  filter(followup_time > 0)
+
+#see page of 6 of https://cran.r-project.org/web/packages/survival/vignettes/timedep.pdf
+new_mal <- tmerge(data1=complete_visits_2011_2014_wide[, 1:16], data2=complete_visits_2011_2014_wide, id=subj_id, tstop=followup_time)
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime1))
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime2))
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime3))
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime4))
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime5))
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime6))
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime7))
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime8))
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime9))
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime10))
+new_mal <- tmerge(new_mal, complete_visits_2011_2014_wide, id=subj_id, mal = event(etime11))
+
+new_mal <- tmerge(new_mal, new_mal, subj_id, enum=cumtdc(tstart))
+dim(new_mal)
+summary(new_mal)
+```
+
+## Run Cox PH model with anderson gill
+
+```{r run cox anderson gill}
+falstatin_FL_fit <-coxph(Surv(tstart, tstop, mal) ~ age + pf_status_enroll + hb_type + falstatin_FL,
+       data = new_mal, cluster = subj_id, robust = TRUE)
+
+falstatin_110_125_fit <-coxph(Surv(tstart, tstop, mal) ~ age + pf_status_enroll + hb_type + falstatin_110_125,
+       data = new_mal, cluster = subj_id, robust = TRUE)
+
+falstatin_289_335_fit <-coxph(Surv(tstart, tstop, mal) ~ age + pf_status_enroll + hb_type + falstatin_289_335,
+       data = new_mal, cluster = subj_id, robust = TRUE)
+
+MAAP_22_143_fit <- coxph(Surv(tstart, tstop, mal) ~ age + pf_status_enroll + hb_type + MAAP_22_143,
+       data = new_mal, cluster = subj_id, robust = TRUE)
+
+MAAP_34_57_fit <-coxph(Surv(tstart, tstop, mal) ~ age + pf_status_enroll + hb_type + MAAP_34_57,
+       data = new_mal, cluster = subj_id, robust = TRUE)
+```
+
+Check if PH assumptions are met
+
+```{r coxzph anderson gill}
+cox.zph(falstatin_FL_fit)
+cox.zph(falstatin_110_125_fit)
+cox.zph(falstatin_289_335_fit)
+cox.zph(MAAP_22_143_fit)
+cox.zph(MAAP_34_57_fit)
+```
+
+View results of Cox PH fit
+
+```{r cox fit tables anderson gill}
+tabcoxph(falstatin_FL_fit, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(falstatin_110_125_fit, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(falstatin_289_335_fit, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(MAAP_22_143_fit, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(MAAP_34_57_fit, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+```
+
+## Predict protection from incident parasitemia
+
+```{r predict protection from incident parasitemia}
+new_survdata_pcr2fever <- readRDS("/Users/tuantran/OneDrive - Indiana University/Manuscripts/Manuscript_p53 polymorphisms and malaria risk_JB/Figures and tables for manuscript/Kali-TP53-polymorphism/pcr2fever_survdata.rds") %>%
+  mutate(subj_id = paste0("Kali", sprintf("%03s", subj_id)))
+
+#merge pcrdata
+followup.time <- 180
+cols <- colnames(seropos_meta_dat_for_surv)[9:13]
+survdata_pcr2fever_180 <- right_join(seropos_meta_dat_for_surv %>%
+                                       mutate(pf_status_enroll = factor(pf_status_enroll,
+                                                                        levels = c(0,1),
+                                                                        labels = c("neg","pos"))) %>%
+                                       mutate(hb_type = factor(ifelse(grepl("S", hb_type), "HbS", "non-HbS"), levels = c("non-HbS", "HbS"))) %>%
+                                       droplevels(),
+                                     new_survdata_pcr2fever,
+                                     by = "subj_id") %>%
+  filter(pf_status_enroll == "neg") %>%
+  mutate_at(cols, factor) %>%
+  mutate(days_pcr2fever = ifelse(days_pcr2fever >= followup.time, followup.time, days_pcr2fever)) %>% #censor after x days followup
+  mutate(clinmal = ifelse(days_pcr2fever >= followup.time, 0, clinmal)) #censor after x days followup
+
+sfit_180			<-		survfit(Surv(days_pcr2fever, clinmal) ~ MAAP_22_143, data = survdata_pcr2fever_180)
+names(sfit_180$strata) <- gsub("MAAP_22_143=", "", names(sfit_180$strata))
+
+# pcr2fever_km_plot_180 <- ggsurvplot(sfit_180, survdata_pcr2fever_180,
+#                      risk.table = TRUE,
+#                      break.time.by = 30,
+#                      legend.title="MAAP_22_143",
+#                      pval = TRUE,
+#                      xlab = "davs since incident parasitemia",
+#                      ylab = "% free of fever",
+#                      censor = TRUE,
+#                      xlim = c(0,92),
+#                      font.x = c(14, "plain", "black"),
+#                      font.y = c(14, "plain", "black"),
+#                      palette = c("darkgray","black"),
+#                      linetype = c(1,3),
+#                      conf.int = TRUE,
+#                      conf.int.alpha = 0.1,
+#                      conf.int.fill = "gray",
+#                      font.family = "Helvetica",
+#                      font.tickslab = c(12, "plain", "black"),
+#                      legend = c(0.3, 0.175),
+#                      pval.coord = c(70, 0.95),
+#                      ggtheme = theme_bw(base_size = 12))
+
+
+coxdata_pcr2fever_180 <- survdata_pcr2fever_180 %>%
+  mutate(start = as.integer(midpoint_date-midpoint_date+1)) %>%
+  mutate(stop = ifelse(clinmal == 1, as.integer(clinmal_date-midpoint_date)+1, as.integer(last_visit_date-midpoint_date)+1)) %>%
+  mutate(stop = ifelse(stop >= 180, 180, stop)) #censor after x days followup
+
+coxfit_falstatin_110_125 <- coxph(Surv(start, stop, clinmal) ~ age + hb_type + falstatin_110_125, data = coxdata_pcr2fever_180)
+coxfit_falstatin_289_335 <- coxph(Surv(start, stop, clinmal) ~ age + hb_type + falstatin_289_335, data = coxdata_pcr2fever_180)
+coxfit_falstatin_FL <- coxph(Surv(start, stop, clinmal) ~ age + hb_type + falstatin_FL, data = coxdata_pcr2fever_180)
+
+coxfit_MAAP_22_143 <- coxph(Surv(start, stop, clinmal) ~ age + hb_type + MAAP_22_143, data = coxdata_pcr2fever_180)
+coxfit_MAAP_34_57 <- coxph(Surv(start, stop, clinmal) ~ age + hb_type + MAAP_34_57, data = coxdata_pcr2fever_180)
+```
+
+```{r coxzph pcr2fever}
+cox.zph(coxfit_falstatin_110_125)
+cox.zph(coxfit_falstatin_289_335)
+cox.zph(coxfit_falstatin_FL)
+cox.zph(coxfit_MAAP_22_143)
+cox.zph(coxfit_MAAP_34_57)
+```
+
+## Summary results risk of febrile malaria after incident parasitemia
+
+```{r tabcox pcr2fever}
+tabcoxph(coxfit_falstatin_110_125, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(coxfit_falstatin_289_335, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(coxfit_falstatin_FL, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(coxfit_MAAP_22_143, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+tabcoxph(coxfit_MAAP_34_57, columns = c("beta.se","hr.ci", "p"),
+          var.labels = list(age = "Age (years)",
+                            pf_status_enroll = "Pf status at enrollment",
+                            hb_type = "Hb genotype"),
+         formatp.list = list(decimals = c(3,4), lowerbound = 1e-9))
+
+```
+
+```{r determining parasite density at incident infection, echo=FALSE, message=FALSE, warning=FALSE}
+#local file
+#clin_dat_long <- readxl::read_excel("/Users/tuantran/Library/CloudStorage/OneDrive-IndianaUniversity/Kalifabougou Data/Read-in Data for Data #Management/combined_all_visits_May_2011_May_2012_FINAL_ParasiteDensities_Short_Master_with_Spleen_09112018.xlsx") %>%
+temp <- tempfile(fileext = ".rds")
+dl <- drive_download(
+  as_id("1QDFBBIEkEQPXBx4PVUtyReDZ8ilgzgUw"), path = temp, overwrite = TRUE)
+#googledrive
+clin_dat_long <- readxl::read_excel(file = dl$local_path) %>%
+  dplyr::select(subj_id, VisitDate, ParasiteDensity.qPCR, SmearParasiteDensityClinic) %>%
+  dplyr::rename(pd_incident_infection = ParasiteDensity.qPCR,
+         pd_incident_clinmal = SmearParasiteDensityClinic) %>%
+  mutate(clinmal_date = as.Date(VisitDate, "%Y-%m-%d")) %>%
+  mutate(pfpos_date = as.Date(VisitDate, "%Y-%m-%d")) %>%
+  dplyr::select(-c(VisitDate)) %>%
+  mutate(subj_id = paste0("Kali", sprintf("%03s", subj_id)))
+
+
+survdata_pcr2fever_pd <- left_join(survdata_pcr2fever_180,
+                                   clin_dat_long %>%
+                                     dplyr::select(subj_id, pfpos_date, pd_incident_infection) %>%
+                                     drop_na(pd_incident_infection),
+                                   by = c("subj_id", "pfpos_date")) %>%
+  left_join(., clin_dat_long %>%
+              dplyr::select(subj_id, clinmal_date, pd_incident_clinmal) %>%
+              drop_na(pd_incident_clinmal),
+            by = c("subj_id", "clinmal_date"))
+
+diff_incident_infecton_plot <- survdata_pcr2fever_pd %>%
+  dplyr::select(subj_id, falstatin_110_125:MAAP_34_57, pd_incident_infection) %>%
+  pivot_longer(cols = falstatin_110_125:MAAP_34_57, names_to = "antigen", values_to = "seropositivity") %>%
+  mutate(log10_pd_incident_infection = log10(pd_incident_infection+1)) %>%
+  ggplot(., aes(x=seropositivity, y = log10_pd_incident_infection)) +
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  theme_bw() +
+  stat_compare_means(method = "wilcox.test") +
+  facet_wrap(~antigen)
+
+diff_incident_clinmal_plot <- survdata_pcr2fever_pd %>%
+  dplyr::select(subj_id, falstatin_110_125:MAAP_34_57, pd_incident_clinmal) %>%
+  pivot_longer(cols = falstatin_110_125:MAAP_34_57, names_to = "antigen", values_to = "seropositivity") %>%
+  mutate(log10_pd_incident_clinmal = log10(pd_incident_clinmal+1)) %>%
+  drop_na() %>%
+  ggplot(., aes(x=seropositivity, y = log10_pd_incident_clinmal)) +
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  theme_bw() +
+  stat_compare_means(method = "wilcox.test") +
+  facet_wrap(~antigen)
+```
+
+```{r growth rate vs high low, echo=FALSE, message=FALSE, warning=FALSE}
+df_growth_rate <- survdata_pcr2fever_pd %>%
+  dplyr::select(subj_id, falstatin_110_125:MAAP_34_57, midpoint_date, pfpos_date, clinmal_date, pd_incident_infection, pd_incident_clinmal) %>%
+  mutate(incident_infection = (pd_incident_infection - 0)/as.integer((pfpos_date - midpoint_date))) %>%
+  mutate(incident_clinmal = (pd_incident_clinmal - 0)/as.integer((clinmal_date - midpoint_date))) %>%
+  mutate(est_growth_rate3 = (log10(pd_incident_clinmal+1) - log10(pd_incident_infection+1))/as.integer((clinmal_date - pfpos_date)))
+
+n_fun <- function(x){
+  return(data.frame(y = 24,
+                    label = length(x)))
+}
+
+global_size <- 14
+
+df_gr_plot <- df_growth_rate %>%
+  pivot_longer(cols = cols,
+               names_to = "antigen",
+               values_to = "seropositivity") %>%
+  pivot_longer(cols = c(incident_infection, incident_clinmal),
+               names_to = "incident_event_type",
+               values_to = "growth_rate") %>%
+  mutate(incident_event_type = factor(ifelse(incident_event_type == "incident_infection",
+                                      "first parasitemia (qPCR)",
+                                      "first malaria episode (smear)"))) %>%
+  mutate(incident_event_type = relevel(incident_event_type, ref = "first parasitemia (qPCR)")) %>%
+  drop_na(growth_rate) %>%
+  ggplot(., aes(x=seropositivity, y = log2(growth_rate))) +
+  geom_boxplot(width = 0.5, fill = "gray", alpha = 0.5) +
+  ggbeeswarm::geom_beeswarm(fill = "gray", alpha = 0.2) +
+  #ylim(c(0,25)) +
+  stat_summary(fun.data = n_fun, geom = "text",
+               aes(group=seropositivity),
+               hjust = 0.5, position = position_dodge(0.6),
+               show.legend = FALSE) +
+  ylab(bquote(log[2]~'(estimated growth rate)')) +
+  scale_y_continuous(expand = expansion(mult = c(0.15, 0.15))) + 
+  theme_bw() +
+  stat_compare_means(method = "wilcox.test", label = "p.format", label.x = 1.35, label.y = 25) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, size =12),
+        text = element_text(size=global_size, family = "Helvetica", color = "black"),
+        axis.text.x= element_text(size=12, color = "black"),
+        axis.text.y= element_text(size=12, color = "black")) +
+  facet_wrap(antigen~incident_event_type)
+```

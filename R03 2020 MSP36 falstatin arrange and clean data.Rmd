@@ -1,0 +1,109 @@
+---
+title: "R03 MSP3.6 (MAAP) and falstatin arrange and clean data"
+author: "Tuan Tran"
+date: "2023-07-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libraries, warning=FALSE, message=FALSE}
+library(readxl)
+library(tidyverse)
+library(ggplot2)
+```
+
+## Get files and read in all data
+
+```{r get files, echo=TRUE}
+filedir <- "/Users/tuantran/Library/CloudStorage/GoogleDrive-tuantran@iu.edu/Shared drives/[Sec] IN-MED-INF-TRANLAB/Tran Lab Shared/Projects/R03 PfMAAP and falstatin/Restart Platemaps and Data/R03 Restart Platemap Templates/"
+filename_list <- list.files(filedir)
+
+my_res_list <- c()
+for(i in filename_list){
+  
+  #read in template with sample descriptions
+  my_template <- read_xlsx(paste0(filedir, i), range = "A1:F97", sheet = 2)
+  
+  #read in 450 OD values and add positions based on row and column positions
+  my_450_res <- read_xlsx(paste0(filedir, i), range = "C2:N10", sheet = 3) %>%
+    mutate(row_names = c("A","B","C","D","E","F","G","H")) %>%
+    pivot_longer(., cols = c("1.0":"12.0"), names_to = "col_names", values_to = "OD_450nm") %>%
+    mutate(col_names = gsub("\\.0","", col_names)) %>%
+    mutate(col_names = sprintf("%02s", col_names)) %>% #add leading zeroes
+    mutate(`Well Location` = paste0(row_names, col_names)) %>%
+    dplyr::select(-c(row_names, col_names))
+  
+  #read in 504 OD values and add positions based on row and column positions
+  my_504_res <- read_xlsx(paste0(filedir, i), range = "Q2:AB10", sheet = 3) %>%
+    mutate(row_names = c("A","B","C","D","E","F","G","H")) %>%
+    pivot_longer(., cols = c("1.0":"12.0"), names_to = "col_names", values_to = "OD_504nm") %>%
+    mutate(col_names = gsub("\\.0","", col_names)) %>%
+    mutate(col_names = sprintf("%02s", col_names)) %>% #add leading zeroes
+    mutate(`Well Location` = paste0(row_names, col_names)) %>%
+    dplyr::select(-c(row_names, col_names))
+  
+  #read in 450-504 OD values and add positions based on row and column positions
+  my_adjOD_res <- read_xlsx(paste0(filedir, i), range = "C12:N20", sheet = 3) %>%
+    mutate(row_names = c("A","B","C","D","E","F","G","H")) %>%
+    pivot_longer(., cols = c("1.0":"12.0"), names_to = "col_names", values_to = "adj_OD") %>%
+    mutate(col_names = gsub("\\.0","", col_names)) %>%
+    mutate(col_names = sprintf("%02s", col_names)) %>% #add leading zeroes
+    mutate(`Well Location` = paste0(row_names, col_names)) %>%
+    dplyr::select(-c(row_names, col_names))
+  
+  #join all dataframes by well location
+  my_res_list[[i]] <- my_template %>%
+    left_join(., my_450_res,
+              by = "Well Location") %>%
+    left_join(., my_504_res,
+              by = "Well Location") %>%
+    left_join(.,my_adjOD_res,
+              by = "Well Location") 
+    
+}
+all_dat <- bind_rows(my_res_list, .id = "plate_name")
+```
+
+## Clean up names
+
+```{r clean up names}
+all_dat_clean <- all_dat 
+colnames(all_dat_clean) <- gsub(" ", "_", tolower(colnames(all_dat_clean)))
+all_dat_clean <- all_dat_clean %>%
+  mutate(group_type = ifelse(well_location ==  "C11" | well_location == "C12",
+         "P17_AMA1_pos_con", group_type)) %>%
+  # mutate(antigen = ifelse(well_location ==  "G11" | well_location == "G12",
+  #        "BSA", antigen)) %>%
+  mutate(group_type = ifelse(grepl("IUHM", sample_name),
+         "naive_neg_con", group_type)) %>%
+  mutate(group_type = ifelse(grepl("IUHM", sample_name),
+         "naive_neg_con", group_type)) %>%
+  mutate(group_type = ifelse(grepl("IUHM", sample_name),
+         "naive_neg_con", group_type)) %>%
+  mutate(plate_name = gsub(" REPEAT ", "REPEAT ", plate_name)) %>%
+  mutate(subj_id = gsub("\\ .*", "", sample_name)) %>%
+  mutate(antigen = sub(".*? ", "", sample_name)) %>%
+  mutate(antigen = gsub(" 1 ug/ml", "", antigen)) %>%
+  mutate(antigen = gsub("Falst", "falst", antigen)) %>%
+  mutate(antigen = gsub("Cons", "conserved", antigen)) %>%
+  mutate(plate_name = gsub("of ", "", plate_name)) %>%
+  mutate(assay_date = gsub("REPEAT ", "", plate_name)) %>%
+  mutate(assay_date = paste0("20", gsub("\\ .*", "", assay_date))) %>%
+  mutate(assay_date = as.Date(assay_date, '%Y%m%d')) %>%
+  mutate(plate_number = sub(".*R03 ", "", plate_name)) %>%
+  mutate(plate_number = gsub(".xlsx", "", plate_number)) %>%
+  mutate(plate_number = gsub(" ", "", plate_number)) %>%
+  mutate(descriptor1_value = ifelse(is.na(descriptor1_value), "Include", descriptor1_value)) %>%
+  filter(descriptor1_value!="Exclude") %>%
+  dplyr::select(assay_date, plate_name, plate_number, well_location, group_type, group_name, subj_id, antigen, sample_name, od_450nm, od_504nm, adj_od)
+```
+
+### Save data to file
+
+```{r save data as rds and excel file, include=TRUE, eval=FALSE, echo=TRUE}
+write_rds(all_dat_clean, "falstatin_msp36_data_07072023.rds") #07052023 is before Oscar cleaned up files in folder
+writexl::write_xlsx(all_dat_clean, "falstatin_msp36_data_07072023.xlsx") #07072023 is AFTER Oscar cleaned up files in folder
+```
